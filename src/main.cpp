@@ -63,6 +63,8 @@ void setBrightness() {
 void setup() {
   system_update_cpu_freq(80);
   Serial.begin(9600);
+
+  WiFi.setSleepMode(WIFI_LIGHT_SLEEP);
   
   // 1. HARD DISABLE WIFI ON BOOT
   WiFi.mode(WIFI_OFF); 
@@ -76,6 +78,8 @@ void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
+
+  timeClient.begin();
 
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { for(;;); }
   
@@ -117,7 +121,8 @@ void systemStateMachine() {
     // ----------------------------------------------------
     case SYS_WIFI_START:
       Serial.println("[SYS] Waking WiFi...");
-      WiFi.forceSleepWake();
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
       delay(1);
       WiFi.mode(WIFI_STA);
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -152,6 +157,7 @@ void systemStateMachine() {
               lastSyncTime = now;
               Serial.println("[SYS] Time Synced");
            }
+           timeClient.end();
         }
 
         // 2. DND Webhook
@@ -199,7 +205,7 @@ void loop() {
     // LIGHT SLEEP MANAGEMENT
     // Only sleep if WiFi is completely OFF (IDLE state)
     if (sysState == SYS_IDLE) {
-       delay(50); // ESP8266 Auto-Light-Sleep engages here
+       delay(20); // ESP8266 Auto-Light-Sleep engages here
     } else {
        delay(1); // Minimal delay to keep Watchdog happy while networking
     }
@@ -251,14 +257,14 @@ void handleButton() {
   lastButtonState = currentButtonState;
 }
 
-void triggerBuzzer(int beeps, int duration) {
+/*void triggerBuzzer(int beeps, int duration) {
   for(int i = 0; i < beeps; i++) {
     tone(BUZZER_PIN, 1000);
     delay(duration);
     noTone(BUZZER_PIN);
-    delay(100);
+    delay(duration);
   }
-}
+}*/
 
 void saveSession() {
   sessionCount++;
