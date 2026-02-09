@@ -4,7 +4,14 @@
 
 #include <Arduino.h>
 
-// Declare the function so main.cpp knows it exists
-void logToGoogle(String type, int durationMinutes);
+// Queue a log entry in RAM
+void queueLog(String type, int durationMinutes);
+
+// Check if data is waiting to be uploaded
+bool loggerHasPending();
+
+// Perform the upload (Assumes WiFi is ALREADY Connected)
+// Returns true if successful, false if failed
+bool performLogUpload();
 
 #endif

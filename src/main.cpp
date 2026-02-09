@@ -17,7 +17,6 @@
 #include <Fonts/FreeMono9pt7b.h>
 #include <Fonts/FreeSansBold12pt7b.h>
 
-
 // --- OBJECT INITIALIZATION ---
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 WiFiUDP ntpUDP;
@@ -26,67 +25,49 @@ NTPClient timeClient(ntpUDP, "pool.ntp.org", NTP_OFFSET);
 // --- VARIABLES ---
 String weekDays[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}; 
 
-// State Variables 
+// Logic States
 Mode currentMode = CLOCK;
-NetworkState netState = NET_IDLE;
+SystemState sysState = SYS_IDLE;
 
+// Timers
 unsigned long timerStartTime = 0;
 unsigned long timerDuration = 0; 
+unsigned long lastSyncTime = 0;
+unsigned long wifiConnectStart = 0;
+
+// Button Debounce
 bool lastButtonState = HIGH;
 unsigned long buttonPressedTime = 0;
+
+// Session Data
 int sessionCount = 0;
-unsigned long lastSyncTime = 0;
-unsigned long wifiConnectStartTime = 0;
 
 // --- FUNCTION PROTOTYPES ---
 void setBrightness();
-void killWiFi();
-void wakeWiFi();
+void systemStateMachine();
 void triggerBuzzer(int beeps, int duration = 200);
 void saveSession();
 void clearSessions();
-void handleNetwork();
 void handleButton();
 void drawClock();
 void drawPomodoro();
 
-// --- IMPLEMENTATION ---
-
+// --- HELPER FUNCTIONS ---
 void setBrightness() {
-  uint8_t contrast = 100;
-  uint8_t precharge = 0xF1;  
   Wire.beginTransmission(0x3C);
-  Wire.write(0x00);     
-  Wire.write(0x81);     
-  Wire.write(contrast); 
-  Wire.write(0xD9);     
-  Wire.write(precharge);
+  Wire.write(0x00); Wire.write(0x81); Wire.write(100); 
+  Wire.write(0xD9); Wire.write(0xF1);
   Wire.endTransmission();
 }
 
-void killWiFi() {
-  WiFi.disconnect(true);  
-  WiFi.mode(WIFI_OFF);    
-  WiFi.forceSleepBegin(); // Forces RF hardware to sleep (Duty Cycle OFF)
-  delay(1);
-}
-
-void wakeWiFi() {
-  WiFi.forceSleepWake();  // Wakes RF hardware (Duty Cycle ON)
-  delay(1);               
-  WiFi.mode(WIFI_STA);    
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD); 
-}
-
 void setup() {
-  // Set CPU to 80MHz (Good balance for standard running)
   system_update_cpu_freq(80);
   Serial.begin(9600);
   
+  // 1. HARD DISABLE WIFI ON BOOT
   WiFi.mode(WIFI_OFF); 
   WiFi.forceSleepBegin();
-  delay(1);
-  WiFi.setSleepMode(WIFI_LIGHT_SLEEP);
+  delay(1); 
   
   EEPROM.begin(4); 
   sessionCount = EEPROM.read(EEPROM_ADDR);
@@ -96,75 +77,178 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
 
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
-    for(;;);
-  }
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { for(;;); }
   
   display.clearDisplay();
   setBrightness();
-  
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
-  display.setCursor(12, 30);
-  display.print("STARTING CLOCK...");
+  display.setCursor(10, 30);
+  display.print("SYSTEM BOOT");
   display.display();
+  delay(500);
 
-  // --- Initial Blocking Sync ---
-  wakeWiFi();
-  
-  int retry = 0;
-  while (WiFi.status() != WL_CONNECTED && retry < 30) {
-    delay(500);
-    retry++;
-  }
+  // Force an initial sync by setting time to 0
+  lastSyncTime = 0; 
+}
 
-  if (WiFi.status() == WL_CONNECTED) {
-    display.clearDisplay();
-    display.setCursor(1, 28);
-    display.print("BABY JUST A MOVEMENT"); 
-    display.display();
+// --- CORE SYSTEM STATE MACHINE ---
+void systemStateMachine() {
+  unsigned long now = millis();
 
-    timeClient.begin();
-    
-    int ntpRetry = 0;
-    bool syncSuccess = false;
-    
-    while (ntpRetry < 10 && !syncSuccess) {
-      if (timeClient.forceUpdate()) {
-         if (timeClient.getEpochTime() > 946684800) {
-            syncSuccess = true;
-         }
+  switch (sysState) {
+    // ----------------------------------------------------
+    // STATE 1: IDLE (Monitoring)
+    // ----------------------------------------------------
+    case SYS_IDLE:
+      {
+        bool needsNTP = (now - lastSyncTime > SYNC_INTERVAL) || (lastSyncTime == 0);
+        bool needsLog = loggerHasPending();
+        bool needsDND = dndHasPending();
+
+        if (needsNTP || needsLog || needsDND) {
+          sysState = SYS_WIFI_START;
+        }
       }
-      if (!syncSuccess) delay(500);
-      ntpRetry++;
-    }
+      break;
 
-    if (syncSuccess) {
-       lastSyncTime = millis();
-    } else {
-       lastSyncTime = millis() - SYNC_INTERVAL + 10000;
+    // ----------------------------------------------------
+    // STATE 2: WAKE RADIO
+    // ----------------------------------------------------
+    case SYS_WIFI_START:
+      Serial.println("[SYS] Waking WiFi...");
+      WiFi.forceSleepWake();
+      delay(1);
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      wifiConnectStart = now;
+      sysState = SYS_WIFI_WAIT;
+      break;
+
+    // ----------------------------------------------------
+    // STATE 3: WAIT FOR CONNECTION
+    // ----------------------------------------------------
+    case SYS_WIFI_WAIT:
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("[SYS] WiFi Connected: ");
+        Serial.println(WiFi.localIP());
+        sysState = SYS_TASK_RUN;
+      } 
+      else if (now - wifiConnectStart > WIFI_CONNECT_TIMEOUT_MS) {
+        Serial.println("[SYS] WiFi Timeout. Aborting.");
+        sysState = SYS_WIFI_STOP; // Fail safely
+      }
+      break;
+
+    // ----------------------------------------------------
+    // STATE 4: RUN NETWORK TASKS
+    // ----------------------------------------------------
+    case SYS_TASK_RUN:
+      {
+        // 1. NTP Sync
+        if ((now - lastSyncTime > SYNC_INTERVAL) || lastSyncTime == 0) {
+           timeClient.begin();
+           if(timeClient.forceUpdate()) {
+              lastSyncTime = now;
+              Serial.println("[SYS] Time Synced");
+           }
+        }
+
+        // 2. DND Webhook
+        if (dndHasPending()) {
+            performDndSync();
+        }
+
+        // 3. Google Logging
+        if (loggerHasPending()) {
+            performLogUpload();
+        }
+
+        // Task complete
+        sysState = SYS_WIFI_STOP;
+      }
+      break;
+
+    // ----------------------------------------------------
+    // STATE 5: POWER DOWN
+    // ----------------------------------------------------
+    case SYS_WIFI_STOP:
+      Serial.println("[SYS] Sleeping Radio...");
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      WiFi.forceSleepBegin(); // Critical for Light Sleep
+      delay(1); 
+      sysState = SYS_IDLE;
+      break;
+  }
+}
+
+void loop() {
+  handleButton();
+  systemStateMachine();
+
+  if (currentMode == CLOCK) {
+    static unsigned long lastUpdate = 0;
+    if (millis() - lastUpdate >= 1000) {
+       lastUpdate = millis();
        display.clearDisplay();
-       display.setCursor(10, 30);
-       display.print("NTP Failed!");
+       drawClock();
        display.display();
-       delay(1000);
     }
-    killWiFi();
-  } else {
-    display.clearDisplay();
-    display.setCursor(10,30);
-    display.print("WiFi Failed!");
-    display.display();
-    delay(1000);
-    lastSyncTime = millis() - SYNC_INTERVAL + 10000;
-    killWiFi();
-  }
+    
+    // LIGHT SLEEP MANAGEMENT
+    // Only sleep if WiFi is completely OFF (IDLE state)
+    if (sysState == SYS_IDLE) {
+       delay(50); // ESP8266 Auto-Light-Sleep engages here
+    } else {
+       delay(1); // Minimal delay to keep Watchdog happy while networking
+    }
 
-  currentMode = CLOCK;
-  
-  while(digitalRead(BUTTON_PIN) == LOW) {
-    delay(10);
+  } else {
+    // Focus Mode - High refresh rate
+    display.clearDisplay();
+    drawPomodoro();
+    display.display();
+    delay(10); 
   }
+}
+
+// --- LOGIC HANDLERS ---
+
+void handleButton() {
+  bool currentButtonState = digitalRead(BUTTON_PIN);
+  unsigned long now = millis();
+  
+  if (currentButtonState == LOW && lastButtonState == HIGH) {
+    buttonPressedTime = now;
+  }
+  
+  if (currentButtonState == HIGH && lastButtonState == LOW) {
+    unsigned long pressDuration = now - buttonPressedTime;
+    
+    // LONG PRESS: Reset / Mode Switch
+    if (pressDuration >= LONG_PRESS_MS) {
+      if (currentMode == CLOCK) {
+        clearSessions();
+      } else {
+        // Cancel Focus
+        currentMode = CLOCK;
+        queueDNDChange(false); // Queue DND OFF
+        triggerBuzzer(2, 100);
+      }
+    } 
+    // SHORT PRESS: Start Focus
+    else if (pressDuration > 50) {
+      if (currentMode == CLOCK) {
+        currentMode = FOCUS;
+        timerDuration = 25 * 60; 
+        timerStartTime = now;
+        queueDNDChange(true); // Queue DND ON
+        triggerBuzzer(1); 
+      }
+    }
+  }
+  lastButtonState = currentButtonState;
 }
 
 void triggerBuzzer(int beeps, int duration) {
@@ -178,9 +262,7 @@ void triggerBuzzer(int beeps, int duration) {
 
 void saveSession() {
   sessionCount++;
-  if (sessionCount > MAX_SESSIONS) {
-    sessionCount = 0;
-  }
+  if (sessionCount > MAX_SESSIONS) sessionCount = 0;
   EEPROM.write(EEPROM_ADDR, sessionCount);
   EEPROM.commit();
 }
@@ -192,110 +274,18 @@ void clearSessions() {
   triggerBuzzer(1, 1000);
 }
 
-void handleNetwork() {
-  unsigned long currentMillis = millis();
-  switch (netState) {
-    case NET_IDLE:
-      if (currentMillis - lastSyncTime >= SYNC_INTERVAL) {
-        Serial.println("Background Sync Start");
-        wakeWiFi(); 
-        wifiConnectStartTime = currentMillis;
-        netState = NET_CONNECTING;
-      }
-      break;
-    case NET_CONNECTING:
-      if (WiFi.status() == WL_CONNECTED) {
-        netState = NET_UPDATING;
-      } 
-      else if (currentMillis - wifiConnectStartTime > 15000) {
-        killWiFi();
-        lastSyncTime = currentMillis; 
-        netState = NET_IDLE;
-      }
-      break;
-    case NET_UPDATING:
-      if (timeClient.forceUpdate()) {
-         Serial.println("NTP Success");
-      }
-      lastSyncTime = millis();
-      killWiFi(); 
-      netState = NET_IDLE;
-      break;
-  }
-}
-
-void handleButton() {
-  bool currentButtonState = digitalRead(BUTTON_PIN);
-  unsigned long now = millis();
-  if (currentButtonState == LOW && lastButtonState == HIGH) {
-    buttonPressedTime = now;
-  }
-  
-  if (currentButtonState == HIGH && lastButtonState == LOW) {
-    unsigned long pressDuration = now - buttonPressedTime;
-    if (pressDuration >= LONG_PRESS_MS) {
-      if (currentMode == CLOCK) {
-        clearSessions();
-      } else {
-        currentMode = CLOCK;
-        timerStartTime = 0;
-        triggerBuzzer(2, 100);
-        queueDNDChange(false);
-      }
-    } else if (pressDuration > 50) {
-      if (currentMode == CLOCK) {
-        currentMode = FOCUS;
-        timerDuration = 25 * 60; 
-        timerStartTime = now;
-        triggerBuzzer(1); 
-        queueDNDChange(true);
-      }
-    }
-  }
-  lastButtonState = currentButtonState;
-}
-
-void loop() {
-  handleButton();
-  handleNetwork();
-
-  handleDNDBackground();
-
-  if (currentMode == CLOCK) {
-    // Non-blocking display update (every 1 second)
-    static unsigned long lastUpdate = 0;
-    if (millis() - lastUpdate >= 1000) {
-       lastUpdate = millis();
-       display.clearDisplay();
-       drawClock();
-       display.display();
-    }
-
-       if (netState == NET_IDLE) {
-       // Sleep for 50ms. The CPU halts here, saving power.
-       delay(50); 
-       } else {
-       delay(1); 
-       }
-
-  } else {
-    // Pomodoro Mode - update frequently for responsiveness
-    display.clearDisplay();
-    drawPomodoro();
-    display.display();
-    delay(10); // Small delay to prevent WDT reset
-  }
-}
-
 void drawClock() {
   display.setFont();
   display.setTextSize(1);
   display.setCursor(75, 0);
-  display.print("Sess: ");
-  display.print(sessionCount);
+  display.print("Sess: "); display.print(sessionCount);
+
+  // Status Indicator (Dot at top left if WiFi is active)
+  if (sysState != SYS_IDLE) display.fillCircle(2, 2, 2, SSD1306_WHITE);
 
   display.setFont(&FreeSansBold9pt7b);
   display.setCursor(5, 30); 
+  
   int rawHours = timeClient.getHours();
   int displayHours = rawHours % 12;
   if (displayHours == 0) displayHours = 12;
@@ -307,42 +297,32 @@ void drawClock() {
   display.setFont();
   display.setCursor(85, 20);
   display.print(rawHours >= 12 ? "PM" : "AM");
-
   display.drawFastHLine(0, 40, 128, SSD1306_WHITE);
 
-  time_t rawtime = timeClient.getEpochTime();
-  struct tm * ti = localtime(&rawtime);
-  
   display.setFont(&FreeMono9pt7b);
   display.setCursor(5, 56);
   display.print(weekDays[timeClient.getDay()]);
-
-  display.setCursor(70, 56);
-  char dateBuffer[10];
-  snprintf(dateBuffer, sizeof(dateBuffer), "%02d/%02d", ti->tm_mday, ti->tm_mon + 1);
-  display.print(dateBuffer);
 }
 
 void drawPomodoro() {
   unsigned long elapsed = (millis() - timerStartTime) / 1000;
+  
   if (elapsed >= timerDuration) {
     if (currentMode == FOCUS) {
-
-      display.clearDisplay();
-      display.setCursor(10, 35);
-      display.println("Logging...");
-      display.display();
-
-      logToGoogle("Focus", 25);
+      // 1. Queue the Log
+      queueLog("Focus", 25);
+      
+      // 2. Queue DND Off
       queueDNDChange(false);
 
+      // 3. Switch to Break
       currentMode = BREAK;
       timerDuration = 5 * 60; 
       timerStartTime = millis();
       triggerBuzzer(2);
       
-      killWiFi();
     } else {
+      // Break Finished
       saveSession();
       currentMode = CLOCK;
       triggerBuzzer(3);
@@ -354,27 +334,10 @@ void drawPomodoro() {
   int mins = remaining / 60;
   int secs = remaining % 60;
 
-  display.setFont(); // Switch to default small font for headers
-  
-  // Left: Mode Title
+  display.setFont(); 
   display.setCursor(0, 0);
   display.print(currentMode == FOCUS ? "FOCUSING" : "BREAK TIME");
 
-  // Right: Current Time (HH:MM)
-  int pHours = timeClient.getHours();
-  int pDisplayHours = pHours % 12;
-  if (pDisplayHours == 0) pDisplayHours = 12;
-  
-  char smallTimeBuf[6];
-  snprintf(smallTimeBuf, sizeof(smallTimeBuf), "%d:%02d", pDisplayHours, timeClient.getMinutes());
-  
-  // Align to right edge (approx width calculation)
-  // 128 - (length * 6 pixels)
-  int xPos = 128 - (strlen(smallTimeBuf) * 6);
-  display.setCursor(xPos, 0);
-  display.print(smallTimeBuf);
-
-  // Main Timer Font
   display.setFont(&FreeSansBold12pt7b);
   display.setCursor(25, 40);
   char timerBuf[10];

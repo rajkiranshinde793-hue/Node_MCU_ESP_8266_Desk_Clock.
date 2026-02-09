@@ -17,11 +17,23 @@
 #define LONG_PRESS_MS 500
 #define SYNC_INTERVAL 1800000 // 30 Minutes
 
+// Network Timeouts
+#define WIFI_CONNECT_TIMEOUT_MS 10000 
+#define HTTP_TIMEOUT_MS 5000
+
 // NTP Settings 
 #define NTP_OFFSET 19800 // GMT +5:30
 
-// Enums (Must be here so main.cpp understands them) 
+// Enums 
 enum Mode { CLOCK, FOCUS, BREAK };
-enum NetworkState { NET_IDLE, NET_CONNECTING, NET_UPDATING };
+
+// --- NEW SYSTEM STATE MACHINE ---
+enum SystemState { 
+    SYS_IDLE,           // Radio OFF, CPU Light Sleep capable
+    SYS_WIFI_START,     // Wake Radio, Begin Connection
+    SYS_WIFI_WAIT,      // Wait for IP
+    SYS_TASK_RUN,       // Perform HTTP uploads/NTP
+    SYS_WIFI_STOP       // Disconnect, Radio Sleep
+};
 
 #endif
