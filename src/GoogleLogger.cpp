@@ -13,9 +13,6 @@ void ensureWiFiConnected() {
 
     Serial.println("[Logger] Waking WiFi...");
     
-    // Force wake RF hardware
-    WiFi.forceSleepWake();
-    delay(1);
     WiFi.mode(WIFI_STA);
     
     // 3. EXPLICITLY CONNECT (This was missing!)
@@ -75,11 +72,5 @@ void logToGoogle(String type, int durationMinutes) {
     } else {
         Serial.println("[Logger] Error: WiFi not connected, cannot log.");
     }
-
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-    WiFi.forceSleepBegin();
-    delay(1);
-    Serial.println("[Logger] WiFi Powered Down.");
-    
+    Serial.println("[Logger] Log sequence completed.");
 }

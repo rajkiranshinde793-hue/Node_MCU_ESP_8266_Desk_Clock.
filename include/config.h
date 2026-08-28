@@ -4,8 +4,13 @@
 #include <Arduino.h>
 
 // Hardware Pins 
-#define BUTTON_PIN D5
-#define BUZZER_PIN D6
+#define POT_PIN A0
+#define BUTTON_1_PIN D5
+#define BUTTON_PIN BUTTON_1_PIN // Alias for backward compatibility
+#define BUTTON_2_PIN D3
+#define BUTTON_3_PIN D4
+#define BUTTON_4_PIN D6
+#define BUZZER_PIN D7
 
 // OLED display settings 
 #define SCREEN_WIDTH 128

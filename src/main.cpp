@@ -7,10 +7,13 @@
 #include <EEPROM.h>
 #include <Wire.h> 
 
-#include "Config.h"
+#include "config.h"
 #include "credentials.h"  
 #include "GoogleLogger.h"
 #include "DNDControl.h"
+#include "buzzer.h"
+#include "MQTT.h"
+#include "pot.h"
 
 // Custom Fonts 
 #include <Fonts/FreeSansBold9pt7b.h>
@@ -32,28 +35,40 @@ NetworkState netState = NET_IDLE;
 
 unsigned long timerStartTime = 0;
 unsigned long timerDuration = 0; 
-bool lastButtonState = HIGH;
-unsigned long buttonPressedTime = 0;
 int sessionCount = 0;
 unsigned long lastSyncTime = 0;
 unsigned long wifiConnectStartTime = 0;
+
+// Potentiometer & Multi-Button State Variables
+int rawPotValue = 0;
+
+bool lastBtn1State = HIGH;
+unsigned long btn1PressTime = 0;
+
+bool lastBtn2State = HIGH;
+unsigned long btn2PressTime = 0;
+
+bool lastBtn3State = HIGH;
+unsigned long btn3PressTime = 0;
+
+bool lastBtn4State = HIGH;
+unsigned long btn4PressTime = 0;
 
 // --- FUNCTION PROTOTYPES ---
 void setBrightness();
 void killWiFi();
 void wakeWiFi();
-void triggerBuzzer(int beeps, int duration = 200);
 void saveSession();
 void clearSessions();
 void handleNetwork();
-void handleButton();
+void handleInputs();
 void drawClock();
 void drawPomodoro();
 
 // --- IMPLEMENTATION ---
 
 void setBrightness() {
-  uint8_t contrast = 100;
+  uint8_t contrast = 255; // Max brightness (0xFF)
   uint8_t precharge = 0xF1;  
   Wire.beginTransmission(0x3C);
   Wire.write(0x00);     
@@ -65,36 +80,36 @@ void setBrightness() {
 }
 
 void killWiFi() {
-  WiFi.disconnect(true);  
-  WiFi.mode(WIFI_OFF);    
-  WiFi.forceSleepBegin(); // Forces RF hardware to sleep (Duty Cycle OFF)
-  delay(1);
+  // Wi-Fi optimization/shutdown disabled to keep MQTT active for CHIRAG
 }
 
 void wakeWiFi() {
-  WiFi.forceSleepWake();  // Wakes RF hardware (Duty Cycle ON)
-  delay(1);               
-  WiFi.mode(WIFI_STA);    
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD); 
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleepMode(WIFI_NONE_SLEEP); // Disable Wi-Fi modem sleep completely (100% active radio)
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(true);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD); 
+  }
 }
 
 void setup() {
-  // Set CPU to 80MHz (Good balance for standard running)
-  system_update_cpu_freq(80);
   Serial.begin(9600);
-  
-  WiFi.mode(WIFI_OFF); 
-  WiFi.forceSleepBegin();
-  delay(1);
-  WiFi.setSleepMode(WIFI_LIGHT_SLEEP);
+  delay(100);
+  Serial.println("\n[SYSTEM] ESP8266 Desk Clock Starting...");
   
   EEPROM.begin(4); 
   sessionCount = EEPROM.read(EEPROM_ADDR);
   if (sessionCount > MAX_SESSIONS) sessionCount = 0;
 
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
+  // Initialize Hardware Pins
+  pinMode(BUTTON_1_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_2_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_3_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_4_PIN, INPUT_PULLUP);
+  potInit();
+
+  buzzerInit();
 
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
     for(;;);
@@ -119,6 +134,7 @@ void setup() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("[WiFi] Connected successfully");
     display.clearDisplay();
     display.setCursor(1, 28);
     display.print("BABY JUST A MOVEMENT"); 
@@ -141,38 +157,35 @@ void setup() {
 
     if (syncSuccess) {
        lastSyncTime = millis();
+       playSyncSuccessTune();
     } else {
        lastSyncTime = millis() - SYNC_INTERVAL + 10000;
        display.clearDisplay();
        display.setCursor(10, 30);
        display.print("NTP Failed!");
        display.display();
+       playErrorTone();
        delay(1000);
     }
-    killWiFi();
+    
+    // Initialize MQTT module
+    initMQTT();
+
   } else {
+    Serial.println("[WiFi] Connection Failed");
     display.clearDisplay();
     display.setCursor(10,30);
     display.print("WiFi Failed!");
     display.display();
+    playErrorTone();
     delay(1000);
     lastSyncTime = millis() - SYNC_INTERVAL + 10000;
-    killWiFi();
   }
 
   currentMode = CLOCK;
   
-  while(digitalRead(BUTTON_PIN) == LOW) {
+  while(digitalRead(BUTTON_1_PIN) == LOW) {
     delay(10);
-  }
-}
-
-void triggerBuzzer(int beeps, int duration) {
-  for(int i = 0; i < beeps; i++) {
-    tone(BUZZER_PIN, 1000);
-    delay(duration);
-    noTone(BUZZER_PIN);
-    delay(100);
   }
 }
 
@@ -189,7 +202,7 @@ void clearSessions() {
   sessionCount = 0;
   EEPROM.write(EEPROM_ADDR, 0);
   EEPROM.commit();
-  triggerBuzzer(1, 1000);
+  playResetTune();
 }
 
 void handleNetwork() {
@@ -208,7 +221,6 @@ void handleNetwork() {
         netState = NET_UPDATING;
       } 
       else if (currentMillis - wifiConnectStartTime > 15000) {
-        killWiFi();
         lastSyncTime = currentMillis; 
         netState = NET_IDLE;
       }
@@ -218,28 +230,40 @@ void handleNetwork() {
          Serial.println("NTP Success");
       }
       lastSyncTime = millis();
-      killWiFi(); 
       netState = NET_IDLE;
       break;
   }
 }
 
-void handleButton() {
-  bool currentButtonState = digitalRead(BUTTON_PIN);
+void handleInputs() {
+  // Read Potentiometer (Smoothed 8-sample average)
+  rawPotValue = readPotSmoothed();
+
+  // Print potentiometer value on Serial monitor when rotated/changed
+  static int lastPrintedPot = -1;
+  if (abs(rawPotValue - lastPrintedPot) >= 10) {
+    lastPrintedPot = rawPotValue;
+    int potPct = readPotPercent();
+    Serial.printf("[POT] Raw: %d | Percent: %d%%\n", rawPotValue, potPct);
+  }
+
   unsigned long now = millis();
-  if (currentButtonState == LOW && lastButtonState == HIGH) {
-    buttonPressedTime = now;
+
+  // --- Button 1 (Main Pomodoro / Clock Control Button: Pin D5) ---
+  bool curBtn1 = digitalRead(BUTTON_1_PIN);
+  if (curBtn1 == LOW && lastBtn1State == HIGH) {
+    btn1PressTime = now;
   }
   
-  if (currentButtonState == HIGH && lastButtonState == LOW) {
-    unsigned long pressDuration = now - buttonPressedTime;
+  if (curBtn1 == HIGH && lastBtn1State == LOW) {
+    unsigned long pressDuration = now - btn1PressTime;
     if (pressDuration >= LONG_PRESS_MS) {
       if (currentMode == CLOCK) {
         clearSessions();
       } else {
         currentMode = CLOCK;
         timerStartTime = 0;
-        triggerBuzzer(2, 100);
+        playResetTune();
         queueDNDChange(false);
       }
     } else if (pressDuration > 50) {
@@ -247,16 +271,47 @@ void handleButton() {
         currentMode = FOCUS;
         timerDuration = 25 * 60; 
         timerStartTime = now;
-        triggerBuzzer(1); 
+        playFocusStartTune(); 
         queueDNDChange(true);
       }
     }
   }
-  lastButtonState = currentButtonState;
+  lastBtn1State = curBtn1;
+
+  // --- Physical Button 2 (Pin D3) -> CHIRAG Logical Button 1 ---
+  bool curBtn2 = digitalRead(BUTTON_2_PIN);
+  if (curBtn2 == LOW && lastBtn2State == HIGH) {
+    btn2PressTime = now;
+    Serial.println("[BUTTON] Physical Button 2");
+    playButtonTone();
+    sendChiragButtonEvent(1);
+  }
+  lastBtn2State = curBtn2;
+
+  // --- Physical Button 3 (Pin D4) -> CHIRAG Logical Button 2 ---
+  bool curBtn3 = digitalRead(BUTTON_3_PIN);
+  if (curBtn3 == LOW && lastBtn3State == HIGH) {
+    btn3PressTime = now;
+    Serial.println("[BUTTON] Physical Button 3");
+    playButtonTone();
+    sendChiragButtonEvent(2);
+  }
+  lastBtn3State = curBtn3;
+
+  // --- Physical Button 4 (Pin D8) -> CHIRAG Logical Button 3 ---
+  bool curBtn4 = digitalRead(BUTTON_4_PIN);
+  if (curBtn4 == LOW && lastBtn4State == HIGH) {
+    btn4PressTime = now;
+    Serial.println("[BUTTON] Physical Button 4");
+    playButtonTone();
+    sendChiragButtonEvent(3);
+  }
+  lastBtn4State = curBtn4;
 }
 
 void loop() {
-  handleButton();
+  handleInputs();
+  handleMQTT();
   handleNetwork();
 
   handleDNDBackground();
@@ -270,14 +325,7 @@ void loop() {
        drawClock();
        display.display();
     }
-
-       if (netState == NET_IDLE) {
-       // Sleep for 50ms. The CPU halts here, saving power.
-       delay(50); 
-       } else {
-       delay(1); 
-       }
-
+    delay(1); 
   } else {
     // Pomodoro Mode - update frequently for responsiveness
     display.clearDisplay();
@@ -300,8 +348,8 @@ void drawClock() {
   int displayHours = rawHours % 12;
   if (displayHours == 0) displayHours = 12;
   
-  char timeBuffer[10];
-  sprintf(timeBuffer, "%02d:%02d:%02d", displayHours, timeClient.getMinutes(), timeClient.getSeconds());
+  char timeBuffer[16];
+  snprintf(timeBuffer, sizeof(timeBuffer), "%02u:%02u:%02u", (unsigned int)displayHours, (unsigned int)timeClient.getMinutes(), (unsigned int)timeClient.getSeconds());
   display.print(timeBuffer);
 
   display.setFont();
@@ -318,8 +366,8 @@ void drawClock() {
   display.print(weekDays[timeClient.getDay()]);
 
   display.setCursor(70, 56);
-  char dateBuffer[10];
-  snprintf(dateBuffer, sizeof(dateBuffer), "%02d/%02d", ti->tm_mday, ti->tm_mon + 1);
+  char dateBuffer[16];
+  snprintf(dateBuffer, sizeof(dateBuffer), "%02u/%02u", (unsigned int)ti->tm_mday, (unsigned int)(ti->tm_mon + 1));
   display.print(dateBuffer);
 }
 
@@ -339,13 +387,11 @@ void drawPomodoro() {
       currentMode = BREAK;
       timerDuration = 5 * 60; 
       timerStartTime = millis();
-      triggerBuzzer(2);
-      
-      killWiFi();
+      playBreakStartTune();
     } else {
       saveSession();
       currentMode = CLOCK;
-      triggerBuzzer(3);
+      playSessionCompleteTune();
     }
     return;
   }
@@ -365,8 +411,8 @@ void drawPomodoro() {
   int pDisplayHours = pHours % 12;
   if (pDisplayHours == 0) pDisplayHours = 12;
   
-  char smallTimeBuf[6];
-  snprintf(smallTimeBuf, sizeof(smallTimeBuf), "%d:%02d", pDisplayHours, timeClient.getMinutes());
+  char smallTimeBuf[16];
+  snprintf(smallTimeBuf, sizeof(smallTimeBuf), "%u:%02u", (unsigned int)pDisplayHours, (unsigned int)timeClient.getMinutes());
   
   // Align to right edge (approx width calculation)
   // 128 - (length * 6 pixels)
@@ -377,8 +423,8 @@ void drawPomodoro() {
   // Main Timer Font
   display.setFont(&FreeSansBold12pt7b);
   display.setCursor(25, 40);
-  char timerBuf[10];
-  snprintf(timerBuf, sizeof(timerBuf), "%02d:%02d", mins, secs);
+  char timerBuf[16];
+  snprintf(timerBuf, sizeof(timerBuf), "%02u:%02u", (unsigned int)(mins > 0 ? mins : 0), (unsigned int)(secs > 0 ? secs : 0));
   display.print(timerBuf);
   
   int progressWidth = map(elapsed, 0, timerDuration, 0, 128);

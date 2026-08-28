@@ -32,8 +32,6 @@ void handleDNDBackground() {
                 dndState = DND_SENDING;
             } else {
                 // Wake up WiFi (Fire and Forget)
-                WiFi.forceSleepWake();
-                delay(1);
                 WiFi.mode(WIFI_STA);
                 WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
                 
@@ -71,11 +69,6 @@ void handleDNDBackground() {
                 
                 Serial.printf("[DND] Result: %d\n", code);
             }
-            WiFi.disconnect(true);
-            WiFi.mode(WIFI_OFF);
-            WiFi.forceSleepBegin();
-            delay(1); 
-            
             dndState = DND_IDLE; 
             break;
     }
